@@ -5,8 +5,6 @@ __pycache__/
 
 # 数据和输出
 data/
-datasets/
-outputs/
 runs/
 
 # IDE
