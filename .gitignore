@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 数据和输出
+data/
+datasets/
+outputs/
+runs/
+
+# IDE
+.vscode/
+.idea/
