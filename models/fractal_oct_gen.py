@@ -54,6 +54,14 @@ DEFAULT_CONFIG = {
     'occ_window': 64,         # z-order 窗口 = 8 个兄弟组
     'occ_attn_heads': 8,      # 须整除 occ_hidden_dim（512/8=64）
     'occ_attn_layers': 3,
+    # 细层辅助监督：用同父节点的软概率平滑二值目标，缓解薄壳/空洞
+    'aux_soft_weight': 0.20,
+    'aux_soft_blend': 0.35,
+    'aux_soft_start_depth': 4,
+    'field_loss_weight': 0.50,
+    'field_loss_start_depth': 4,
+    'grad_loss_weight': 0.30,
+    'grad_loss_start_depth': 6,
 }
 
 # 大模型配置（显存充足时追求极致质量）
@@ -69,6 +77,13 @@ LARGE_CONFIG = {
     'occ_window': 64,
     'occ_attn_heads': 12,     # 768/12=64
     'occ_attn_layers': 4,
+    'aux_soft_weight': 0.20,
+    'aux_soft_blend': 0.35,
+    'aux_soft_start_depth': 4,
+    'field_loss_weight': 0.50,
+    'field_loss_start_depth': 4,
+    'grad_loss_weight': 0.30,
+    'grad_loss_start_depth': 6,
 }
 
 # 小模型配置（快速烟雾测试）
@@ -84,6 +99,13 @@ SMALL_CONFIG = {
     'occ_window': 32,
     'occ_attn_heads': 4,      # 96/4=24
     'occ_attn_layers': 1,
+    'aux_soft_weight': 0.20,
+    'aux_soft_blend': 0.35,
+    'aux_soft_start_depth': 4,
+    'field_loss_weight': 0.50,
+    'field_loss_start_depth': 4,
+    'grad_loss_weight': 0.30,
+    'grad_loss_start_depth': 6,
 }
 
 
@@ -94,6 +116,8 @@ class FractalOctGen(nn.Module):
         super().__init__()
         cfg = {**DEFAULT_CONFIG, **(config or {})}
         self.cfg = cfg
+        self.field_loss_weight = float(self.cfg.get('field_loss_weight', 0.0))
+        self.field_loss_start_depth = int(self.cfg.get('field_loss_start_depth', 10**9))
 
         self.ar_depths: List[int] = list(AR_DEPTHS)
         self.occ_depths: List[int] = list(OCC_DEPTHS)
@@ -143,10 +167,18 @@ class FractalOctGen(nn.Module):
 
         losses: Dict[int, torch.Tensor] = {}
         prev_cond_full: Optional[torch.Tensor] = None        # [B, N_prev, D]
+        aux_soft_weight = float(self.cfg.get('aux_soft_weight', 0.0))
+        aux_soft_blend = float(self.cfg.get('aux_soft_blend', 0.0))
+        aux_soft_start_depth = int(self.cfg.get('aux_soft_start_depth', 10**9))
+        field_loss_weight = float(self.cfg.get('field_loss_weight', 0.0))
+        field_loss_start_depth = int(self.cfg.get('field_loss_start_depth', 10**9))
+        grad_loss_weight = float(self.cfg.get('grad_loss_weight', 0.0))
+        grad_loss_start_depth = int(self.cfg.get('grad_loss_start_depth', 10**9))
 
         # ── 自回归层 ──────────────────────────────────────────────────────────
         for i, d in enumerate(self.ar_depths):
             split_d = batch[f'split_{d}']
+            field_d = batch.get(f'field_{d}', split_d.float())
             xyz_d = batch[f'xyz_{d}']
             mask_d = batch[f'mask_{d}']
 
@@ -156,31 +188,59 @@ class FractalOctGen(nn.Module):
                 parent_cond = _gather_parent_cond(
                     prev_cond_full, batch[f'parent_idx_{d}'], mask_d)
 
-            cond_full, logits = self.ar_modules[i](
+            cond_full, logits, field_pred, grad_pred = self.ar_modules[i](
                 split_labels=split_d.long(),
                 xyz=xyz_d,
                 parent_cond=parent_cond,
                 padding_mask=mask_d,
             )
-            losses[d] = _masked_bce_loss(
+            layer_loss = _masked_bce_loss(
                 logits, split_d.float(), mask_d,
                 pos_weight=_auto_pos_weight(split_d, mask_d))
+            if d >= field_loss_start_depth and field_loss_weight > 0:
+                depth_weight = 1.0 + 0.25 * max(0, d - field_loss_start_depth)
+                layer_loss = layer_loss + field_loss_weight * depth_weight * _masked_field_loss(
+                    field_pred, field_d.float(), mask_d)
+            grad_key = f'grad_{d}'
+            if d >= grad_loss_start_depth and grad_loss_weight > 0 and grad_key in batch:
+                depth_weight = 1.0 + 0.25 * max(0, d - grad_loss_start_depth)
+                layer_loss = layer_loss + grad_loss_weight * depth_weight * _masked_grad_loss(
+                    grad_pred, batch[grad_key], mask_d)
+            losses[d] = layer_loss
             prev_cond_full = cond_full
 
         # ── 占据层级联 ────────────────────────────────────────────────────────
         for j, d in enumerate(self.occ_depths):
             split_d = batch[f'split_{d}']
+            field_d = batch.get(f'field_{d}', split_d.float())
             xyz_d = batch[f'xyz_{d}']
             mask_d = batch[f'mask_{d}']
+            parent_idx_d = batch.get(f'parent_idx_{d}')
 
             parent_cond = _gather_parent_cond(
                 prev_cond_full, batch[f'parent_idx_{d}'], mask_d)
 
-            logits, cond_full = self.occ_modules[j](
+            logits, field_pred, grad_pred, cond_full = self.occ_modules[j](
                 xyz=xyz_d, parent_cond=parent_cond, mask=mask_d)
-            losses[d] = _masked_bce_loss(
+            layer_loss = _masked_bce_loss(
                 logits, split_d.float(), mask_d,
                 pos_weight=_auto_pos_weight(split_d, mask_d))
+            if parent_idx_d is not None and d >= aux_soft_start_depth and aux_soft_weight > 0:
+                soft_targets = _sibling_smoothed_targets(
+                    split_d.float(), parent_idx_d, mask_d, blend=aux_soft_blend)
+                soft_loss = _masked_bce_loss(logits, soft_targets, mask_d)
+                depth_weight = 1.0 + 0.25 * max(0, d - aux_soft_start_depth)
+                layer_loss = layer_loss + aux_soft_weight * depth_weight * soft_loss
+            if d >= field_loss_start_depth and field_loss_weight > 0:
+                depth_weight = 1.0 + 0.25 * max(0, d - field_loss_start_depth)
+                layer_loss = layer_loss + field_loss_weight * depth_weight * _masked_field_loss(
+                    field_pred, field_d.float(), mask_d)
+            grad_key = f'grad_{d}'
+            if d >= grad_loss_start_depth and grad_loss_weight > 0 and grad_key in batch:
+                depth_weight = 1.0 + 0.25 * max(0, d - grad_loss_start_depth)
+                layer_loss = layer_loss + grad_loss_weight * depth_weight * _masked_grad_loss(
+                    grad_pred, batch[grad_key], mask_d)
+            losses[d] = layer_loss
             prev_cond_full = cond_full
 
         total = sum(losses.values())
@@ -203,7 +263,7 @@ class FractalOctGen(nn.Module):
         class_id: int = 0,
         temperature_l0: float = 1.0,
         temperature_l1: float = 1.0,
-        temperature_l2: float = 1.0,
+        temperature_l2: float = 0.0,
         device: torch.device = None,
         **kwargs,
     ) -> Dict[str, object]:
@@ -235,8 +295,9 @@ class FractalOctGen(nn.Module):
 
         generated = torch.zeros(B, 0, dtype=torch.long, device=device)
         cond_steps = []
+        field_steps = []
         for step in range(64):
-            sampled, cond_s = self.ar_modules[0].sample_one_step(
+            sampled, cond_s, field_s, _ = self.ar_modules[0].sample_one_step(
                 generated_so_far=generated,
                 xyz=xyz_2,
                 parent_cond=class_cond.expand(B, 64, -1),
@@ -245,44 +306,52 @@ class FractalOctGen(nn.Module):
             )
             generated = torch.cat([generated, sampled.unsqueeze(1)], dim=1)
             cond_steps.append(cond_s)
+            field_steps.append(field_s)
         split_2 = generated                                   # [B,64]
         cond_2 = torch.stack(cond_steps, dim=1)               # [B,64,D]
+        field_2 = torch.stack(field_steps, dim=1)             # [B,64]
 
         # ── 逐形状级联 ────────────────────────────────────────────────────────
         out_split = {d: [] for d in self.all_depths}
+        out_field = {d: [] for d in self.all_depths}
         out_xyz = {d: [] for d in self.all_depths}
 
         for b in range(B):
             cur_split = split_2[b]                            # [64]
             cur_xyz = xyz_2[b]                                # [64,3]
             cur_cond = cond_2[b]                              # [64,D]
+            cur_field = field_2[b]                            # [64]
             cur_depth = d0
             out_split[d0].append(cur_split)
+            out_field[d0].append(cur_field)
             out_xyz[d0].append(cur_xyz)
 
             # 其余 AR 层（全局自回归）
             for i in range(1, len(self.ar_depths)):
                 d = self.ar_depths[i]
-                cur_split, cur_xyz, cur_cond = self._sample_ar_level(
+                cur_split, cur_field, cur_xyz, cur_cond = self._sample_ar_level(
                     parent_split=cur_split, parent_xyz=cur_xyz, parent_cond=cur_cond,
                     parent_depth=cur_depth, ar_module=self.ar_modules[i],
                     temperature=temperature_l1, device=device)
                 cur_depth = d
                 out_split[d].append(cur_split)
+                out_field[d].append(cur_field)
                 out_xyz[d].append(cur_xyz)
 
             # 占据层级联（并行 MLP）
             for j, d in enumerate(self.occ_depths):
-                cur_split, cur_xyz, cur_cond = self._sample_occ_level(
+                cur_split, cur_field, cur_xyz, cur_cond = self._sample_occ_level(
                     parent_split=cur_split, parent_xyz=cur_xyz, parent_cond=cur_cond,
                     parent_depth=cur_depth, occ_module=self.occ_modules[j],
                     temperature=temperature_l2, device=device)
                 cur_depth = d
                 out_split[d].append(cur_split)
+                out_field[d].append(cur_field)
                 out_xyz[d].append(cur_xyz)
 
         return {
             'split': out_split,
+            'field': out_field,
             'xyz': out_xyz,
             'depths': self.all_depths,
             'finest_depth': self.occ_depths[-1] if self.occ_depths else self.ar_depths[-1],
@@ -294,7 +363,7 @@ class FractalOctGen(nn.Module):
         parent_split: torch.Tensor, parent_xyz: torch.Tensor,
         parent_cond: torch.Tensor, parent_depth: int,
         ar_module: OctAR, temperature: float, device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """展开 parent_split==1 节点的 8 个子节点，沿全局 z-order 自回归采样。
 
         与训练 teacher forcing 的序列完全对应（消除 train-inference 不一致）。
@@ -303,6 +372,7 @@ class FractalOctGen(nn.Module):
         split_idx = (parent_split == 1).nonzero(as_tuple=True)[0]
         if len(split_idx) == 0:
             return (torch.zeros(0, dtype=torch.long, device=device),
+                    torch.zeros(0, device=device),
                     torch.zeros(0, 3, device=device),
                     torch.zeros(0, D, device=device))
         if len(split_idx) > self.MAX_EXPAND_NODES:
@@ -322,15 +392,18 @@ class FractalOctGen(nn.Module):
         pcond_b = pcond.unsqueeze(0)
         generated = torch.zeros(1, 0, dtype=torch.long, device=device)
         cond_steps = []
+        field_steps = []
         for step in range(N):
-            sampled, cond_s = ar_module.sample_one_step(
+            sampled, cond_s, field_s, _ = ar_module.sample_one_step(
                 generated_so_far=generated, xyz=xyz_b,
                 parent_cond=pcond_b, step=step, temperature=temperature)
             generated = torch.cat([generated, sampled.unsqueeze(1)], dim=1)
             cond_steps.append(cond_s[0])
+            field_steps.append(field_s[0])
         split = generated[0]                                  # [N]
         cond = torch.stack(cond_steps, dim=0)                 # [N,D]
-        return split, xyz, cond
+        field = torch.stack(field_steps, dim=0)               # [N]
+        return split, field, xyz, cond
 
     # ── 单形状：占据层并行采样 ────────────────────────────────────────────────
     def _sample_occ_level(
@@ -338,12 +411,13 @@ class FractalOctGen(nn.Module):
         parent_split: torch.Tensor, parent_xyz: torch.Tensor,
         parent_cond: torch.Tensor, parent_depth: int,
         occ_module: OccupancyMLP, temperature: float, device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """展开 parent_split==1 节点的 8 个子节点，MLP 并行预测占据。"""
         D = occ_module.cond_dim
         split_idx = (parent_split == 1).nonzero(as_tuple=True)[0]
         if len(split_idx) == 0:
             return (torch.zeros(0, dtype=torch.long, device=device),
+                    torch.zeros(0, device=device),
                     torch.zeros(0, 3, device=device),
                     torch.zeros(0, D, device=device))
         if len(split_idx) > self.MAX_EXPAND_NODES:
@@ -360,8 +434,9 @@ class FractalOctGen(nn.Module):
         xyz = torch.cat(child_xyz, dim=0)                     # [n*8,3]
         pcond = parent_cond_s.repeat_interleave(8, dim=0)     # [n*8,D]
 
-        logits, cond = occ_module(xyz=xyz.unsqueeze(0), parent_cond=pcond.unsqueeze(0))
+        logits, field, _, cond = occ_module(xyz=xyz.unsqueeze(0), parent_cond=pcond.unsqueeze(0))
         logits = logits[0]                                    # [n*8]
+        field = field[0]                                      # [n*8]
         cond = cond[0]                                        # [n*8,D]
 
         if temperature == 0.0:
@@ -369,7 +444,7 @@ class FractalOctGen(nn.Module):
         else:
             prob = torch.sigmoid(logits / temperature)
             split = torch.bernoulli(prob).long()
-        return split, xyz, cond
+        return split, field, xyz, cond
 
 
 # ─── 辅助函数 ──────────────────────────────────────────────────────────────────
@@ -403,6 +478,22 @@ def _masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor,
     )
 
 
+def _masked_field_loss(pred: torch.Tensor, targets: torch.Tensor,
+                      mask: torch.Tensor) -> torch.Tensor:
+    """只在有效节点上回归连续场。"""
+    if mask.sum() == 0:
+        return pred.sum() * 0.0
+    return F.smooth_l1_loss(pred[mask], targets[mask], reduction='mean')
+
+
+def _masked_grad_loss(pred_grad: torch.Tensor, target_grad: torch.Tensor,
+                      mask: torch.Tensor) -> torch.Tensor:
+    """只在有效节点上回归 SDF 空间梯度（法向）。"""
+    if mask.sum() == 0:
+        return pred_grad.sum() * 0.0
+    return F.mse_loss(pred_grad[mask], target_grad[mask], reduction='mean')
+
+
 def _gather_parent_cond(
     cond: torch.Tensor,
     parent_idx: torch.Tensor,
@@ -423,6 +514,43 @@ def _gather_parent_cond(
     gathered = torch.gather(cond, dim=1, index=idx.unsqueeze(-1).expand(-1, -1, D))
     gathered = gathered * mask.unsqueeze(-1).to(gathered.dtype)
     return gathered
+
+
+def _sibling_smoothed_targets(
+    targets: torch.Tensor,
+    parent_idx: torch.Tensor,
+    mask: torch.Tensor,
+    blend: float = 0.35,
+) -> torch.Tensor:
+    """把二值目标混合为“硬标签 + 同父节点平均概率”的软目标。
+
+    这样做能给细层提供连续概率监督，缓解薄壳过窄、局部孔洞和抖动。
+    """
+    blend = float(max(0.0, min(1.0, blend)))
+    soft = targets.float().clone()
+    if parent_idx is None or mask.sum() == 0:
+        return soft
+
+    B, _ = parent_idx.shape
+    for b in range(B):
+        valid = mask[b]
+        if not torch.any(valid):
+            continue
+
+        idx = parent_idx[b, valid].long()
+        vals = targets[b, valid].float()
+        if idx.numel() == 0:
+            continue
+
+        n_groups = int(idx.max().item()) + 1
+        group_sum = torch.zeros(n_groups, device=targets.device, dtype=vals.dtype)
+        group_cnt = torch.zeros(n_groups, device=targets.device, dtype=vals.dtype)
+        group_sum.index_add_(0, idx, vals)
+        group_cnt.index_add_(0, idx, torch.ones_like(vals))
+        sibling_mean = group_sum / group_cnt.clamp(min=1.0)
+        soft[b, valid] = (1.0 - blend) * vals + blend * sibling_mean[idx]
+
+    return soft
 
 
 def _generate_depth2_xyz(batch_size: int, device: torch.device) -> torch.Tensor:

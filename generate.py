@@ -172,6 +172,121 @@ def sample_to_voxel_grid(
     return grid
 
 
+def sample_to_field_grid(
+    field_f: torch.Tensor, xyz_f: torch.Tensor,
+    finest_depth: int, resolution: int = None,
+    default_outside: float = 1.0,
+) -> np.ndarray:
+    """把最细层的连续场节点值重建为稠密标量场。
+
+    约定：field 外部为正、内部为负（标准 SDF），未知区域默认填
+    default_outside（默认 +1，表示外部），避免 Marching Cubes 在空白处
+    把 0 误判为表面。
+
+    当 resolution == 2^finest_depth 时，每个节点对应唯一体素；当分辨率
+    更高时，采用三线性插值散射，使 MC 能在更细网格上提取光滑表面。
+    """
+    grid_dim = 2 ** finest_depth
+    if resolution is None:
+        resolution = grid_dim
+
+    grid = np.full((resolution, resolution, resolution),
+                   default_outside, dtype=np.float32)
+    counts = np.zeros((resolution, resolution, resolution), dtype=np.float32)
+
+    if len(field_f) == 0:
+        return grid
+
+    xyz = xyz_f.cpu().numpy()
+    vals = field_f.detach().cpu().numpy()
+
+    if resolution == grid_dim:
+        max_int = float(2 ** finest_depth - 1)
+        int_coords = np.round(xyz * max_int).astype(int)
+        int_coords = np.clip(int_coords, 0, resolution - 1)
+        for (x, y, z), value in zip(int_coords, vals):
+            grid[x, y, z] += value
+            counts[x, y, z] += 1.0
+        mask = counts > 0
+        grid[mask] /= counts[mask]
+    else:
+        grid_coords = xyz * (resolution - 1)
+        for c, value in zip(grid_coords, vals):
+            x0 = int(np.floor(c[0]))
+            y0 = int(np.floor(c[1]))
+            z0 = int(np.floor(c[2]))
+            x1 = min(x0 + 1, resolution - 1)
+            y1 = min(y0 + 1, resolution - 1)
+            z1 = min(z0 + 1, resolution - 1)
+            dx = c[0] - x0
+            dy = c[1] - y0
+            dz = c[2] - z0
+
+            weights = [
+                ((1 - dx) * (1 - dy) * (1 - dz), x0, y0, z0),
+                ((1 - dx) * (1 - dy) * dz,     x0, y0, z1),
+                ((1 - dx) * dy     * (1 - dz), x0, y1, z0),
+                ((1 - dx) * dy     * dz,     x0, y1, z1),
+                (dx     * (1 - dy) * (1 - dz), x1, y0, z0),
+                (dx     * (1 - dy) * dz,     x1, y0, z1),
+                (dx     * dy     * (1 - dz), x1, y1, z0),
+                (dx     * dy     * dz,     x1, y1, z1),
+            ]
+            for w, ix, iy, iz in weights:
+                grid[ix, iy, iz] += w * value
+                counts[ix, iy, iz] += w
+        mask = counts > 0
+        grid[mask] /= counts[mask]
+
+    return grid
+
+
+def field_to_mesh(field_grid: np.ndarray, level: float = 0.0,
+                  smooth_iters: int = 10,
+                  field_smooth_sigma: float = 0.0) -> trimesh.Trimesh:
+    """从连续 SDF 标量场用 Marching Cubes 提取水密网格。
+
+    约定：field 外部为正、内部为负，level=0 为表面。MC 沿梯度方向
+    （由负到正）提取的表面法向量自然朝外，因此不需要 invert()。
+
+    Args:
+        field_grid: [R, R, R] 连续 SDF 场。
+        level: iso-surface 阈值，默认 0。
+        smooth_iters: Taubin 平滑迭代次数。
+        field_smooth_sigma: 在 MC 前对 SDF 做高斯平滑的 sigma（0=不平滑）。
+
+    Returns:
+        trimesh.Trimesh（法向量朝外）。
+    """
+    from scipy.ndimage import gaussian_filter
+
+    resolution = field_grid.shape[0]
+    grid = field_grid.astype(np.float32)
+
+    if field_smooth_sigma > 0:
+        grid = gaussian_filter(grid, sigma=field_smooth_sigma)
+
+    # 四周补一层“外部”，保证边界处表面封闭
+    padded = np.pad(grid, pad_width=1, mode='constant', constant_values=1.0)
+
+    try:
+        verts, faces, normals, _ = measure.marching_cubes(padded, level=level)
+    except Exception as e:
+        print(f'[WARN] 连续场 Marching Cubes 失败: {e}，返回空网格')
+        return trimesh.Trimesh()
+
+    verts = (verts - 1.0) / (resolution - 1)
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces,
+                            vertex_normals=normals, process=False)
+
+    # 标准 SDF 法向量已朝外，无需 invert
+    if smooth_iters > 0:
+        trimesh.smoothing.filter_taubin(mesh, iterations=smooth_iters)
+
+    return mesh
+
+
 # ─── 可视化（ASCII art 横截面，方便终端预览）──────────────────────────────────
 
 def print_voxel_slice(voxel_grid: np.ndarray, axis: int = 2,
@@ -200,9 +315,9 @@ def generate_shapes(
     model,
     num_samples: int,
     device: torch.device,
-    temperature_l0: float = 1.0,
-    temperature_l1: float = 1.0,
-    temperature_l2: float = 1.0,
+    temperature_l0: float = 0.9,
+    temperature_l1: float = 0.9,
+    temperature_l2: float = 0.0,
     batch_size: int = 4,
     resolution: int = None,
     output_dir: Path = None,
@@ -212,10 +327,15 @@ def generate_shapes(
     keep_largest: bool = True,
     closing_iters: int = 1,
     smooth_iters: int = 10,
+    field_level: float = 0.0,
+    field_smooth_sigma: float = 0.0,
     verbose: bool = True,
 ) -> list:
     """
     批量生成形状并导出。
+
+    网格提取策略：优先使用最细层预测的连续 SDF 场（field_level=0 处等值面）
+    提取水密表面；若场无有效零交叉，则回退到二值体素网格 + Marching Cubes。
 
     Args:
         model: FractalOctGen（已加载权重）
@@ -227,6 +347,10 @@ def generate_shapes(
         output_dir: 输出目录（None 则不保存文件）
         export_mesh: 是否导出 .obj 网格
         export_voxel: 是否导出 .npy 体素网格
+        solidify/keep_largest/closing_iters: 仅作用于导出的二值体素网格
+        smooth_iters: Taubin 平滑迭代次数
+        field_level: 连续场 Marching Cubes 的 iso 阈值
+        field_smooth_sigma: MC 前对 SDF 做高斯平滑的 sigma（0=不平滑）
 
     Returns:
         list of dict（每个形状的结果）
@@ -265,6 +389,7 @@ def generate_shapes(
         for i in range(cur_batch):
             shape_id = n_generated + i
             split_f = out['split'][finest_depth][i]
+            field_f = out['field'][finest_depth][i]
             xyz_f   = out['xyz'][finest_depth][i]
 
             # 统计信息：各深度节点数 / 占据数
@@ -282,7 +407,14 @@ def generate_shapes(
                 split_f, xyz_f, finest_depth=finest_depth, resolution=res
             )
 
+            # 连续 SDF 场：默认未知区域为外部（+1），保证 MC 只提取有效表面
+            field_grid = sample_to_field_grid(
+                field_f, xyz_f, finest_depth=finest_depth, resolution=res,
+                default_outside=1.0,
+            )
+
             # 后处理：薄壳 → 实体（封孔 + 填充 + 去碎块）
+            # 该体素网格用于统计与导出；连续场网格直接用于提面。
             voxel_grid = postprocess_voxel_grid(
                 voxel_grid, solidify=solidify, keep_largest=keep_largest,
                 closing_iters=closing_iters,
@@ -295,6 +427,7 @@ def generate_shapes(
             result = {
                 'shape_id': shape_id,
                 'voxel_grid': voxel_grid,
+                'field_grid': field_grid,
                 'n_occupied': n_voxels,
             }
 
@@ -302,9 +435,23 @@ def generate_shapes(
             if output_dir and export_voxel:
                 np.save(output_dir / f'shape_{shape_id:04d}.npy', voxel_grid)
 
+            if output_dir:
+                np.save(output_dir / f'shape_{shape_id:04d}_field.npy', field_grid)
+
             if output_dir and export_mesh:
-                mesh = voxel_to_mesh(voxel_grid.astype(np.float32),
-                                     smooth_iters=smooth_iters)
+                # 优先从连续 SDF 场提取水密表面；若场无有效零交叉则回退到二值体素
+                field_min = float(field_grid.min())
+                field_max = float(field_grid.max())
+                if field_min < field_level < field_max:
+                    mesh = field_to_mesh(field_grid, level=field_level,
+                                         smooth_iters=smooth_iters,
+                                         field_smooth_sigma=field_smooth_sigma)
+                else:
+                    print(f'[WARN] 形状 {shape_id} 连续场无有效零交叉，'
+                          f'回退到二值体素网格（field range=[{field_min:.3f}, {field_max:.3f}]）')
+                    mesh = voxel_to_mesh(voxel_grid.astype(np.float32),
+                                         level=0.5,
+                                         smooth_iters=smooth_iters)
                 if len(mesh.vertices) > 0:
                     mesh.export(str(output_dir / f'shape_{shape_id:04d}.obj'))
                     result['mesh'] = mesh
@@ -336,22 +483,27 @@ def main():
     parser.add_argument('--resolution', type=int, default=0,
                         help='体素网格分辨率（0=自动，取最细占据层 2^(depth-1)，如 64）')
 
-    parser.add_argument('--temperature_l0', type=float, default=1.0)
-    parser.add_argument('--temperature_l1', type=float, default=1.0)
-    parser.add_argument('--temperature_l2', type=float, default=1.0)
+    parser.add_argument('--temperature_l0', type=float, default=0.9)
+    parser.add_argument('--temperature_l1', type=float, default=0.9)
+    parser.add_argument('--temperature_l2', type=float, default=0.0)
 
     parser.add_argument('--no_mesh', action='store_true', help='不导出网格文件')
     parser.add_argument('--no_voxel', action='store_true', help='不导出体素文件')
 
     # 体素后处理 / 表面提取
     parser.add_argument('--no_solidify', action='store_true',
-                        help='关闭实体化填充（保留空心薄壳）')
+                        help='关闭实体化填充（保留空心薄壳）。仅影响导出的 .npy 体素，'
+                             '连续场提面不受影响。')
     parser.add_argument('--no_keep_largest', action='store_true',
-                        help='关闭"只保留最大连通分量"（保留漂浮碎块）')
+                        help='关闭"只保留最大连通分量"（保留漂浮碎块）。仅影响 .npy 体素。')
     parser.add_argument('--closing_iters', type=int, default=1,
-                        help='形态学闭运算迭代次数（封孔强度，过大会粘连薄机翼）')
+                        help='形态学闭运算迭代次数（封孔强度，过大会粘连薄机翼）。仅影响 .npy 体素。')
     parser.add_argument('--smooth_iters', type=int, default=10,
-                        help='Taubin 网格平滑迭代次数（0=不平滑）')
+                        help='Taubin 网格平滑迭代次数（0=不平滑；对连续场与二值回退均生效）')
+    parser.add_argument('--field_level', type=float, default=0.0,
+                        help='连续场 Marching Cubes 的 iso 阈值（默认 0.0，对应 SDF 表面）')
+    parser.add_argument('--field_smooth_sigma', type=float, default=0.0,
+                        help='MC 前对 SDF 场做高斯平滑的 sigma（0=不平滑，建议 0.3~0.8）')
 
     args = parser.parse_args()
 
@@ -400,6 +552,8 @@ def main():
         keep_largest=not args.no_keep_largest,
         closing_iters=args.closing_iters,
         smooth_iters=args.smooth_iters,
+        field_level=args.field_level,
+        field_smooth_sigma=args.field_smooth_sigma,
         verbose=True,
     )
 

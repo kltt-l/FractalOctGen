@@ -6,6 +6,7 @@ ShapeNet 八叉树数据集（通用多深度版本）
 
 每个深度 d 的张量：
   split_{d}:      [B, N_d]     分裂/占据标签（0/1）
+    field_{d}:      [B, N_d]     连续场目标（SDF/连续占据概率）
   xyz_{d}:        [B, N_d, 3]  归一化 3D 坐标
   mask_{d}:       [B, N_d]     有效位掩码（True=有效）
   parent_idx_{d}: [B, N_d]     指向父层（depth d-1）节点的索引（d≥3）
@@ -82,10 +83,23 @@ class ShapeNetOctreeDataset(Dataset):
             cap = _cap_for(d)
             split_d = data[f'split_{d}'].astype(np.int64)
             xyz_d = data[f'xyz_{d}'].astype(np.float32)
+            field_key = f'field_{d}'
+            if field_key in data.files:
+                field_d = data[field_key].astype(np.float32)
+            else:
+                field_d = split_d.astype(np.float32)
             n = len(split_d)
             n_eff = min(n, cap)
 
+            grad_key = f'grad_{d}'
+            if grad_key in data.files:
+                grad_d = data[grad_key].astype(np.float32)
+            else:
+                grad_d = np.zeros((n, 3), dtype=np.float32)
+
             sample[f'split_{d}'] = torch.from_numpy(np.ascontiguousarray(split_d[:n_eff]))
+            sample[f'field_{d}'] = torch.from_numpy(np.ascontiguousarray(field_d[:n_eff]))
+            sample[f'grad_{d}'] = torch.from_numpy(np.ascontiguousarray(grad_d[:n_eff]))
             sample[f'xyz_{d}'] = torch.from_numpy(np.ascontiguousarray(xyz_d[:n_eff]))
 
             if d > self.pred_depths[0]:
@@ -99,10 +113,13 @@ class ShapeNetOctreeDataset(Dataset):
         return sample
 
 
-def _pad_stack(tensors: List[torch.Tensor], length: int, is_xyz: bool = False):
+def _pad_stack(tensors: List[torch.Tensor], length: int, is_xyz: bool = False,
+                is_grad: bool = False):
     """把变长 1D/2D 张量列表 padding 到固定 length 并 stack，同时返回 mask。"""
     B = len(tensors)
     if is_xyz:
+        out = torch.zeros(B, length, 3, dtype=torch.float32)
+    elif is_grad:
         out = torch.zeros(B, length, 3, dtype=torch.float32)
     else:
         out = torch.zeros(B, length, dtype=torch.long)
@@ -129,8 +146,12 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         max_len = max(b[f'split_{d}'].shape[0] for b in batch)
         max_len = max(max_len, 1)  # 至少 1，避免空张量
         split_pad, mask = _pad_stack([b[f'split_{d}'] for b in batch], max_len)
+        field_pad, _ = _pad_stack([b[f'field_{d}'] for b in batch], max_len)
+        grad_pad, _ = _pad_stack([b[f'grad_{d}'] for b in batch], max_len, is_grad=True)
         xyz_pad, _ = _pad_stack([b[f'xyz_{d}'] for b in batch], max_len, is_xyz=True)
         out[f'split_{d}'] = split_pad
+        out[f'field_{d}'] = field_pad.float()
+        out[f'grad_{d}'] = grad_pad.float()
         out[f'xyz_{d}'] = xyz_pad
         out[f'mask_{d}'] = mask
         if f'parent_idx_{d}' in batch[0]:
@@ -163,7 +184,8 @@ class SyntheticOctreeDataset(Dataset):
                  pred_depths: Optional[List[int]] = None):
         import trimesh as tr
         from utils.octree_utils import (
-            build_octree_from_mesh, extract_octree_data, compute_parent_indices)
+            build_octree_from_mesh, extract_octree_data, compute_parent_indices,
+            mesh_to_sdf_volume)
 
         self.size = size
         self.depth = depth
@@ -175,24 +197,37 @@ class SyntheticOctreeDataset(Dataset):
         print(f'[SyntheticDataset] 生成 {size} 个合成样本（depth={depth}）...')
 
         for i in range(size):
-            n_spheres = rng.integers(1, 4)
-            pts_list = []
-            for _ in range(n_spheres):
-                center = rng.uniform(-0.5, 0.5, 3).astype(np.float32)
-                radius = rng.uniform(0.1, 0.4)
-                n = 800
-                u = rng.standard_normal((n, 3)).astype(np.float32)
-                u /= np.linalg.norm(u, axis=1, keepdims=True)
-                pts_list.append(center + u * radius)
-            pts = np.concatenate(pts_list, axis=0)
-            try:
-                mesh = tr.PointCloud(pts).convex_hull
-            except Exception:
-                mesh = tr.creation.icosphere(subdivisions=2, radius=0.5)
+            # 使用简单基元（球/胶囊/长方体/圆锥）的组合，避免复杂凸包导致 SDF 计算过慢或 OOM
+            primitives = []
+            n_prims = rng.integers(1, 4)
+            for _ in range(n_prims):
+                kind = rng.integers(0, 4)
+                center = rng.uniform(-0.35, 0.35, 3).astype(np.float32)
+                if kind == 0:
+                    radius = float(rng.uniform(0.15, 0.40))
+                    prim = tr.creation.icosphere(subdivisions=rng.integers(2, 4), radius=radius)
+                elif kind == 1:
+                    radius = float(rng.uniform(0.08, 0.18))
+                    height = float(rng.uniform(0.3, 0.8))
+                    prim = tr.creation.capsule(radius=radius, height=height, count=(12, 12))
+                elif kind == 2:
+                    extents = rng.uniform(0.2, 0.7, 3).astype(np.float32)
+                    prim = tr.creation.box(extents=extents)
+                else:
+                    radius = float(rng.uniform(0.15, 0.35))
+                    height = float(rng.uniform(0.3, 0.7))
+                    prim = tr.creation.cone(radius=radius, height=height, sections=24)
+                prim.vertices += center
+                primitives.append(prim)
+            if len(primitives) == 1:
+                mesh = primitives[0]
+            else:
+                mesh = tr.util.concatenate(primitives)
 
             octree = build_octree_from_mesh(mesh, depth=depth, full_depth=full_depth,
                                             num_points=num_points)
-            data = extract_octree_data(octree)
+            field_volume = mesh_to_sdf_volume(mesh, resolution=64)
+            data = extract_octree_data(octree, field_volume=field_volume)
             for d in range(full_depth, depth - 1):
                 data[f'parent_idx_{d+1}'] = compute_parent_indices(octree, parent_depth=d)
             self._cache.append(data)
@@ -210,8 +245,12 @@ class SyntheticOctreeDataset(Dataset):
             cap = _cap_for(d)
             split_d = data.get(f'split_{d}', np.zeros(0, dtype=np.int8)).astype(np.int64)
             xyz_d = data.get(f'xyz_{d}', np.zeros((0, 3), dtype=np.float32)).astype(np.float32)
+            field_d = data.get(f'field_{d}', split_d.astype(np.float32)).astype(np.float32)
+            grad_d = data.get(f'grad_{d}', np.zeros((len(split_d), 3), dtype=np.float32)).astype(np.float32)
             n_eff = min(len(split_d), cap)
             sample[f'split_{d}'] = torch.from_numpy(np.ascontiguousarray(split_d[:n_eff]))
+            sample[f'field_{d}'] = torch.from_numpy(np.ascontiguousarray(field_d[:n_eff]))
+            sample[f'grad_{d}'] = torch.from_numpy(np.ascontiguousarray(grad_d[:n_eff]))
             sample[f'xyz_{d}'] = torch.from_numpy(np.ascontiguousarray(xyz_d[:n_eff]))
             if d > first:
                 pidx = data.get(f'parent_idx_{d}', np.zeros(0, dtype=np.int32)).astype(np.int64)

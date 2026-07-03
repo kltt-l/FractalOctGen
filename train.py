@@ -232,7 +232,7 @@ def main():
     if args.synthetic or not args.data_dir:
         print(f'[INFO] 使用合成数据（{args.synthetic_size} 样本）')
         train_dataset = SyntheticOctreeDataset(size=args.synthetic_size)
-        val_dataset = SyntheticOctreeDataset(size=max(32, args.synthetic_size // 8),
+        val_dataset = SyntheticOctreeDataset(size=min(32, max(4, args.synthetic_size // 4)),
                                               seed=99)
     else:
         train_dataset = ShapeNetOctreeDataset(args.data_dir, split='train')

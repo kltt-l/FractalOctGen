@@ -102,7 +102,7 @@ def build_octree_from_mesh(mesh, depth: int = OCTREE_DEPTH,
     return octree
 
 
-def extract_octree_data(octree: Octree) -> dict:
+def extract_octree_data(octree: Octree, field_volume: np.ndarray = None) -> dict:
     """
     从 ocnn.Octree 提取训练所需的数据：各层的分裂标签、z-order 坐标。
 
@@ -129,6 +129,7 @@ def extract_octree_data(octree: Octree) -> dict:
             data[f'split_{d}'] = np.zeros(0, dtype=np.int8)
             data[f'keys_{d}'] = np.zeros(0, dtype=np.int64)
             data[f'xyz_{d}'] = np.zeros((0, 3), dtype=np.float32)
+            data[f'field_{d}'] = np.zeros(0, dtype=np.float32)
             continue
 
         # 分裂标签
@@ -143,6 +144,14 @@ def extract_octree_data(octree: Octree) -> dict:
         # 3D 坐标（归一化）
         xyz_d = _keys_to_xyz(keys_d, depth=d)  # [n_d, 3] float32
         data[f'xyz_{d}'] = xyz_d
+
+        if field_volume is not None:
+            data[f'field_{d}'] = sample_volume_trilinear(field_volume, xyz_d)
+            grad_volume = compute_sdf_gradient_volume(field_volume)
+            data[f'grad_{d}'] = sample_volume_trilinear(grad_volume, xyz_d)
+        else:
+            data[f'field_{d}'] = split_d.astype(np.float32)
+            data[f'grad_{d}'] = np.zeros((n_d, 3), dtype=np.float32)
 
     return data
 
@@ -160,6 +169,199 @@ def _keys_to_xyz(keys: torch.Tensor, depth: int) -> np.ndarray:
     max_coord = float(2 ** depth - 1) if depth > 0 else 1.0
     xyz = xyz / max_coord
     return xyz.numpy()
+
+
+def load_binvox(filepath: str) -> np.ndarray:
+    """读取标准 binvox 文件，返回布尔占据体素。"""
+    with open(filepath, "rb") as f:
+        header = f.readline().decode("ascii").strip()
+        if not header.startswith("#binvox"):
+            raise ValueError(f"不是有效的 binvox 文件: {filepath}")
+
+        dims = None
+        while True:
+            line = f.readline().decode("ascii").strip()
+            if line.startswith("dim "):
+                dims = tuple(int(v) for v in line.split()[1:4])
+            elif line == "data":
+                break
+
+        if dims is None:
+            raise ValueError(f"binvox 文件缺少 dim 信息: {filepath}")
+
+        raw = np.frombuffer(f.read(), dtype=np.uint8)
+        if raw.size % 2 != 0:
+            raw = raw[: raw.size - 1]
+        values = raw[0::2]
+        counts = raw[1::2]
+        voxels = np.repeat(values, counts).astype(np.bool_)
+        expected = int(np.prod(dims))
+        if voxels.size < expected:
+            voxels = np.pad(voxels, (0, expected - voxels.size), constant_values=False)
+        elif voxels.size > expected:
+            voxels = voxels[:expected]
+        return voxels.reshape(dims)
+
+
+def occupancy_to_sdf(volume: np.ndarray) -> np.ndarray:
+    """由二值占据体素计算归一化 SDF（标准符号：外部为正，内部为负，表面为 0）。"""
+    from scipy.ndimage import distance_transform_edt
+
+    occ = volume.astype(bool)
+    # dist_in: 到最近内部体素的距离（外部点为正，内部点为 0）
+    # dist_out: 到最近外部体素的距离（内部点为正，外部点为 0）
+    dist_in = distance_transform_edt(occ)
+    dist_out = distance_transform_edt(~occ)
+    sdf = dist_in - dist_out  # 外部为正，内部为负
+    scale = float(np.max(np.abs(sdf)))
+    if scale <= 0:
+        scale = 1.0
+    return (sdf / scale).astype(np.float32)
+
+
+def mesh_to_sdf_volume(mesh, resolution: int = 128) -> np.ndarray:
+    """从三角网格计算归一化 SDF 体积（标准符号：外部为正，内部为负，表面为 0）。
+
+    网格会先被归一化到 [-0.9, 0.9]^3（与 build_octree_from_mesh 一致），
+    然后在 [-1, 1]^3 的规则网格上计算带符号距离并截断到 [-1, 1]。
+
+    实现会先用 quadric 简化限制网格面数，并对查询点分块，避免复杂网格在
+    trimesh.proximity.signed_distance 中一次性分配过大中间数组而 OOM。
+
+    Args:
+        mesh: trimesh.Trimesh 对象（会被复制，不修改原对象）。
+        resolution: SDF 网格分辨率，默认 128。
+
+    Returns:
+        np.ndarray: shape [resolution, resolution, resolution]，dtype float32。
+    """
+    import trimesh
+    from scipy.ndimage import distance_transform_edt, zoom
+
+    mesh = mesh.copy()
+    pts = mesh.vertices
+    center = (pts.max(axis=0) + pts.min(axis=0)) / 2.0
+    pts = pts - center
+    scale = float(np.abs(pts).max())
+    if scale > 0:
+        pts = pts / scale * 0.9
+    mesh.vertices = pts
+
+    # 面片过多时先简化，降低 SDF 查询的内存/计算开销
+    max_faces = 20000
+    if len(mesh.faces) > max_faces:
+        try:
+            mesh = mesh.simplify_quadric_decimation(max_faces)
+        except Exception:
+            pass
+
+    lin = np.linspace(-1.0, 1.0, resolution)
+    x, y, z = np.meshgrid(lin, lin, lin, indexing='ij')
+    pts_grid = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1).astype(np.float32)
+
+    sdf = None
+    try:
+        # 分块查询，避免一次性产生过大中间数组（复杂网格 × 稠密网格时常见 OOM）
+        n_grid = len(pts_grid)
+        chunk = max(1, min(n_grid, 32768))
+        chunks = []
+        for i in range(0, n_grid, chunk):
+            q = pts_grid[i:i + chunk]
+            d = trimesh.proximity.signed_distance(mesh, q)
+            chunks.append(np.asarray(d, dtype=np.float32))
+        sdf = np.concatenate(chunks).reshape(resolution, resolution, resolution)
+        sdf = np.nan_to_num(sdf, nan=1.0, posinf=1.0, neginf=-1.0)
+        # 校验符号：中心点应在内部。若相反则翻转。
+        center_val = float(sdf[resolution // 2, resolution // 2, resolution // 2])
+        if center_val > 0:
+            sdf = -sdf
+    except Exception:
+        sdf = None
+
+    if sdf is None:
+        # 回退：低分辨率 occupancy + 距离变换，再插值到目标分辨率，内存更友好
+        try:
+            low_res = min(resolution, 64)
+            lin_low = np.linspace(-1.0, 1.0, low_res)
+            xl, yl, zl = np.meshgrid(lin_low, lin_low, lin_low, indexing='ij')
+            pts_low = np.stack([xl.ravel(), yl.ravel(), zl.ravel()], axis=-1).astype(np.float32)
+            # 对 contains 也分块，防止复杂网格 OOM
+            contains_chunk = max(1, min(len(pts_low), 32768))
+            inside_list = []
+            for i in range(0, len(pts_low), contains_chunk):
+                inside_list.append(mesh.contains(pts_low[i:i + contains_chunk]))
+            inside = np.concatenate(inside_list).reshape(low_res, low_res, low_res)
+            dist_in = distance_transform_edt(inside)
+            dist_out = distance_transform_edt(~inside)
+            sdf_low = dist_in - dist_out
+            if resolution != low_res:
+                sdf = zoom(sdf_low, resolution / low_res, order=1)
+            else:
+                sdf = sdf_low
+        except Exception:
+            sdf = np.ones((resolution, resolution, resolution), dtype=np.float32)
+
+    max_abs = float(np.abs(sdf).max())
+    if max_abs > 0:
+        sdf = np.clip(sdf / max_abs, -1.0, 1.0)
+    return sdf.astype(np.float32)
+
+
+def sample_volume_trilinear(volume: np.ndarray, xyz: np.ndarray) -> np.ndarray:
+    """在归一化坐标 xyz 上对 3D 体积做三线性采样。
+
+    Args:
+        volume: [R, R, R] 标量场，或 [R, R, R, C] 向量场（最后一维为通道）。
+        xyz:    [N, 3] 归一化到 [0,1]^3 的坐标。
+
+    Returns:
+        [N] 标量采样值，或 [N, C] 向量采样值。
+    """
+    from scipy.ndimage import map_coordinates
+
+    coords = np.asarray(xyz, dtype=np.float32)
+    if coords.size == 0:
+        if volume.ndim == 3:
+            return np.zeros((0,), dtype=np.float32)
+        else:
+            return np.zeros((0, volume.shape[-1]), dtype=np.float32)
+
+    grid_max = np.array(volume.shape[:3], dtype=np.float32) - 1.0
+    sample_coords = np.clip(coords * grid_max[None, :], 0.0, grid_max[None, :])
+
+    if volume.ndim == 3:
+        sampled = map_coordinates(
+            volume,
+            [sample_coords[:, 0], sample_coords[:, 1], sample_coords[:, 2]],
+            order=1,
+            mode="nearest",
+        )
+        return sampled.astype(np.float32)
+    else:
+        # 向量场：逐通道采样
+        C = volume.shape[-1]
+        out = np.zeros((coords.shape[0], C), dtype=np.float32)
+        for c in range(C):
+            out[:, c] = map_coordinates(
+                volume[..., c],
+                [sample_coords[:, 0], sample_coords[:, 1], sample_coords[:, 2]],
+                order=1,
+                mode="nearest",
+            )
+        return out
+
+
+def compute_sdf_gradient_volume(sdf_volume: np.ndarray) -> np.ndarray:
+    """由 SDF 体素场计算空间梯度场 ∇SDF，shape [R,R,R,3]。
+
+    对标准 SDF（外部为正、内部为负），梯度方向即为外法向。
+    """
+    from scipy.ndimage import gaussian_filter
+
+    # 轻微高斯平滑后再求导，抑制数值噪声
+    smooth = gaussian_filter(sdf_volume, sigma=0.5)
+    gz, gy, gx = np.gradient(smooth)
+    return np.stack([gx, gy, gz], axis=-1).astype(np.float32)
 
 
 def compute_parent_indices(octree: Octree, parent_depth: int) -> np.ndarray:
@@ -187,18 +389,21 @@ def compute_parent_indices(octree: Octree, parent_depth: int) -> np.ndarray:
 
     valid_mask = (children_d >= 0).numpy()
     split_node_indices = np.where(valid_mask)[0]  # [n_split]
-    child_starts = children_d[valid_mask].numpy()  # [n_split], first child index
+    child_starts = children_d[valid_mask].numpy()  # [n_split], 子节点组索引
 
-    # 每个分裂节点贡献连续的 8 个子节点
+    # 每个分裂节点贡献连续的 8 个子节点。
+    # ocnn 的 children[d][i] 存储的是“组索引”而非绝对位置，
+    # 实际子节点在 depth-(d+1) 数组中的起始位置 = c_start * 8。
     for local_i, (parent_i, c_start) in enumerate(zip(split_node_indices, child_starts)):
-        parent_idx[c_start: c_start + 8] = parent_i
+        start = int(c_start) * 8
+        parent_idx[start: start + 8] = parent_i
 
     return parent_idx
 
 
-def save_octree_data(octree: Octree, filepath: str) -> None:
+def save_octree_data(octree: Octree, filepath: str, field_volume: np.ndarray = None) -> None:
     """提取并保存八叉树数据到 .npz 文件。"""
-    data = extract_octree_data(octree)
+    data = extract_octree_data(octree, field_volume=field_volume)
 
     # 额外保存各层的父节点索引（方便 Dataset 直接加载）
     depth = int(data['depth'])

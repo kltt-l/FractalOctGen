@@ -30,6 +30,9 @@ from tqdm import tqdm
 
 from utils.octree_utils import (
     build_octree_from_mesh,
+    load_binvox,
+    occupancy_to_sdf,
+    mesh_to_sdf_volume,
     save_octree_data,
     OCTREE_DEPTH,
 )
@@ -47,6 +50,20 @@ def find_mesh_file(model_dir: str) -> str:
     """在模型目录中查找网格文件（OBJ / OFF / PLY），优先 model_normalized。"""
     import glob
     for ext in ["*.obj", "*.off", "*.ply"]:
+        files = glob.glob(os.path.join(model_dir, "**", ext), recursive=True)
+        if files:
+            for f in files:
+                if "model_normalized" in os.path.basename(f):
+                    return f
+            return files[0]
+    return None
+
+
+def find_binvox_file(model_dir: str) -> str:
+    """优先查找形状的实体 binvox 文件。"""
+    import glob
+    preferred = ["*.solid.binvox", "*.surface.binvox", "*.binvox"]
+    for ext in preferred:
         files = glob.glob(os.path.join(model_dir, "**", ext), recursive=True)
         if files:
             for f in files:
@@ -91,7 +108,20 @@ def _process_one_shapenet(task):
         octree = build_octree_from_mesh(mesh, depth=depth, num_points=num_points)
         if octree.nnum[depth].item() < 4:
             return (model_id, False, f"八叉树节点数过少（{octree.nnum[depth].item()}）")
-        save_octree_data(octree, output_path)
+        field_volume = None
+        # 优先从 ShapeNet 附带的 binvox 读取 SDF；否则直接从 mesh 计算
+        binvox_path = find_binvox_file(model_dir)
+        if binvox_path is not None:
+            try:
+                field_volume = occupancy_to_sdf(load_binvox(binvox_path))
+            except Exception:
+                field_volume = None
+        if field_volume is None:
+            try:
+                field_volume = mesh_to_sdf_volume(mesh, resolution=128)
+            except Exception:
+                field_volume = None
+        save_octree_data(octree, output_path, field_volume=field_volume)
         return (model_id, True, "ok")
     except Exception as e:
         return (model_id, False, f"{type(e).__name__}: {e}")

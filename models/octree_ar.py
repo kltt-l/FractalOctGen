@@ -171,7 +171,7 @@ class OctAR(nn.Module):
     对应 FractalGen 中的 AR 类，但针对三维八叉树序列设计：
       1. 节点嵌入：split_emb(label) + pos_emb(xyz) + cond_proj(parent_cond)
       2. Causal GPT Transformer（Pre-LN，SwiGLU FFN）
-      3. 输出头：split logits（当前层）+ cond_out（传递给下一层）
+    3. 输出头：split logits + field（SDF）+ grad（∇SDF）+ cond_out
 
     训练：teacher forcing，输入为 ground-truth 分裂标签（左移一位）
     推理：逐节点自回归生成
@@ -205,8 +205,10 @@ class OctAR(nn.Module):
         ])
         self.norm = nn.LayerNorm(embed_dim)
 
-        # 输出头：(1) 分裂预测；(2) 下层 conditioning
+        # 输出头：(1) 分裂预测；(2) 连续场值；(3) 空间梯度；(4) 下层 conditioning
         self.split_head = nn.Linear(embed_dim, 1)  # → logit
+        self.field_head = nn.Linear(embed_dim, 1)  # → SDF 值
+        self.grad_head = nn.Linear(embed_dim, 3)   # → ∇SDF
         self.cond_out = nn.Linear(embed_dim, cond_dim)  # → 给下一层的条件
 
         self.embed_dim = embed_dim
@@ -231,7 +233,7 @@ class OctAR(nn.Module):
         xyz: torch.Tensor,
         parent_cond: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         训练前向传播（teacher forcing）。
 
@@ -247,6 +249,8 @@ class OctAR(nn.Module):
         Returns:
             cond_for_children: [B, N, D_cond]  传递给子层的 conditioning 向量
             split_logits:      [B, N]           当前层分裂预测 logits（不经 sigmoid）
+            field_values:      [B, N]           连续场预测值
+            grad_values:       [B, N, 3]        SDF 空间梯度预测
         """
         B, N = split_labels.shape
 
@@ -271,9 +275,11 @@ class OctAR(nn.Module):
 
         # ── 输出
         split_logits = self.split_head(x).squeeze(-1)  # [B, N]
+        field_values = self.field_head(x).squeeze(-1)   # [B, N]
+        grad_values = self.grad_head(x)                 # [B, N, 3]
         cond_for_children = self.cond_out(x)           # [B, N, D_cond]
 
-        return cond_for_children, split_logits
+        return cond_for_children, split_logits, field_values, grad_values
 
     @torch.no_grad()
     def sample_one_step(
@@ -283,7 +289,7 @@ class OctAR(nn.Module):
         parent_cond: torch.Tensor,
         step: int,
         temperature: float = 1.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         推理时的单步采样。
 
@@ -300,6 +306,8 @@ class OctAR(nn.Module):
         Returns:
             sampled_label: [B]  在位置 step 采样得到的 0/1 标签
             cond_at_step:  [B, D_cond]  位置 step 的 cond_for_children
+            field_at_step: [B]  位置 step 的连续场预测值
+            grad_at_step:  [B, 3]  位置 step 的 SDF 梯度预测
         """
         B = generated_so_far.shape[0]
 
@@ -319,6 +327,8 @@ class OctAR(nn.Module):
 
         # 取最后一个位置（即第 step 个节点的预测）
         logit_step = self.split_head(x[:, -1])  # [B, 1]
+        field_step = self.field_head(x[:, -1])   # [B, 1]
+        grad_step = self.grad_head(x[:, -1])     # [B, 3]
         cond_step = self.cond_out(x[:, -1])      # [B, D_cond]
 
         # 采样
@@ -328,7 +338,7 @@ class OctAR(nn.Module):
             prob = torch.sigmoid(logit_step.squeeze(-1) / temperature)
             sampled = torch.bernoulli(prob).long()
 
-        return sampled, cond_step
+        return sampled, cond_step, field_step.squeeze(-1), grad_step
 
 
 # ─── 同层局部协调：窗口化双向自注意力 ─────────────────────────────────────────
@@ -425,7 +435,7 @@ class OccupancyMLP(nn.Module):
     流程：
       1. 逐节点特征：trunk(父层 cond + 位置编码)         —— 自顶向下条件
       2. 同层局部协调：若干 WindowAttnBlock              —— 兄弟/邻居横向协调
-      3. 双头输出：占据 logit + 下一层 conditioning
+    3. 三头输出：占据 logit + field（SDF）+ grad（∇SDF）+ cond_out
 
     第 2 步是相对原始"纯并行 MLP"的关键改进：它让同一深度的节点在窗口内互相
     看到对方，弥补"兄弟节点共享父条件却无法协调"的条件独立缺陷，从而减少表面
@@ -467,8 +477,10 @@ class OccupancyMLP(nn.Module):
         else:
             self.attn_blocks = nn.ModuleList()
 
-        # 双头输出
+        # 三头输出
         self.split_head = nn.Linear(hidden_dim, 1)
+        self.field_head = nn.Linear(hidden_dim, 1)
+        self.grad_head = nn.Linear(hidden_dim, 3)
         self.cond_out = nn.Linear(hidden_dim, cond_dim)
 
         self._init_weights()
@@ -488,7 +500,7 @@ class OccupancyMLP(nn.Module):
         xyz: torch.Tensor,
         parent_cond: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             xyz:         [B, N, 3]    归一化 3D 坐标
@@ -497,6 +509,8 @@ class OccupancyMLP(nn.Module):
 
         Returns:
             logits:            [B, N]
+            field_values:      [B, N]
+            grad_values:       [B, N, 3]
             cond_for_children: [B, N, D_cond]
         """
         pos_enc = sinusoidal_pos_enc_3d(xyz, self.hidden_dim)  # [B, N, H]
@@ -510,5 +524,7 @@ class OccupancyMLP(nn.Module):
             h = blk(h, mask=mask)
 
         logits = self.split_head(h).squeeze(-1)
+        field_values = self.field_head(h).squeeze(-1)
+        grad_values = self.grad_head(h)
         cond_for_children = self.cond_out(h)
-        return logits, cond_for_children
+        return logits, field_values, grad_values, cond_for_children

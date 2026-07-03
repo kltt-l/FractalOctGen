@@ -6,6 +6,7 @@ __pycache__/
 # 数据和输出
 data/
 runs/
+datasets/02691156/
 
 # IDE
 .vscode/
