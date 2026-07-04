@@ -192,6 +192,7 @@ def sample_to_field_grid(
 
     grid = np.full((resolution, resolution, resolution),
                    default_outside, dtype=np.float32)
+    accum = np.zeros((resolution, resolution, resolution), dtype=np.float32)
     counts = np.zeros((resolution, resolution, resolution), dtype=np.float32)
 
     if len(field_f) == 0:
@@ -205,10 +206,10 @@ def sample_to_field_grid(
         int_coords = np.round(xyz * max_int).astype(int)
         int_coords = np.clip(int_coords, 0, resolution - 1)
         for (x, y, z), value in zip(int_coords, vals):
-            grid[x, y, z] += value
+            accum[x, y, z] += value
             counts[x, y, z] += 1.0
         mask = counts > 0
-        grid[mask] /= counts[mask]
+        grid[mask] = accum[mask] / counts[mask]
     else:
         grid_coords = xyz * (resolution - 1)
         for c, value in zip(grid_coords, vals):
@@ -233,12 +234,47 @@ def sample_to_field_grid(
                 (dx     * dy     * dz,     x1, y1, z1),
             ]
             for w, ix, iy, iz in weights:
-                grid[ix, iy, iz] += w * value
+                accum[ix, iy, iz] += w * value
                 counts[ix, iy, iz] += w
         mask = counts > 0
-        grid[mask] /= counts[mask]
+        grid[mask] = accum[mask] / np.maximum(counts[mask], 1e-8)
 
     return grid
+
+
+def voxel_to_tsdf_grid(
+    voxel_grid: np.ndarray,
+    truncation: float = 4.0,
+    smooth_sigma: float = 0.0,
+) -> np.ndarray:
+    """Convert a solid occupancy grid to a dense TSDF.
+
+    Sign convention matches the neural field path: outside is positive,
+    inside is negative, and the surface is the zero level set.
+    """
+    from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+    occ = voxel_grid.astype(bool)
+    if occ.sum() == 0:
+        return np.ones(occ.shape, dtype=np.float32)
+    if occ.sum() == occ.size:
+        return -np.ones(occ.shape, dtype=np.float32)
+
+    dist_to_inside = distance_transform_edt(~occ)
+    dist_to_outside = distance_transform_edt(occ)
+    sdf = dist_to_inside - dist_to_outside
+
+    if truncation and truncation > 0:
+        sdf = np.clip(sdf, -truncation, truncation) / float(truncation)
+    else:
+        max_abs = float(np.max(np.abs(sdf)))
+        if max_abs > 0:
+            sdf = sdf / max_abs
+
+    if smooth_sigma > 0:
+        sdf = gaussian_filter(sdf, sigma=smooth_sigma)
+
+    return sdf.astype(np.float32)
 
 
 def field_to_mesh(field_grid: np.ndarray, level: float = 0.0,
@@ -270,7 +306,8 @@ def field_to_mesh(field_grid: np.ndarray, level: float = 0.0,
     padded = np.pad(grid, pad_width=1, mode='constant', constant_values=1.0)
 
     try:
-        verts, faces, normals, _ = measure.marching_cubes(padded, level=level)
+        verts, faces, normals, _ = measure.marching_cubes(
+            padded, level=level, gradient_direction='ascent')
     except Exception as e:
         print(f'[WARN] 连续场 Marching Cubes 失败: {e}，返回空网格')
         return trimesh.Trimesh()
@@ -329,6 +366,7 @@ def generate_shapes(
     smooth_iters: int = 10,
     field_level: float = 0.0,
     field_smooth_sigma: float = 0.0,
+    tsdf_truncation: float = 4.0,
     verbose: bool = True,
 ) -> list:
     """
@@ -351,6 +389,7 @@ def generate_shapes(
         smooth_iters: Taubin 平滑迭代次数
         field_level: 连续场 Marching Cubes 的 iso 阈值
         field_smooth_sigma: MC 前对 SDF 做高斯平滑的 sigma（0=不平滑）
+        tsdf_truncation: 神经场无零交叉时，从实体体素生成 TSDF 的截断距离（体素单位）
 
     Returns:
         list of dict（每个形状的结果）
@@ -419,6 +458,10 @@ def generate_shapes(
                 voxel_grid, solidify=solidify, keep_largest=keep_largest,
                 closing_iters=closing_iters,
             )
+            tsdf_grid = voxel_to_tsdf_grid(
+                voxel_grid, truncation=tsdf_truncation,
+                smooth_sigma=field_smooth_sigma,
+            )
 
             if verbose:
                 print_voxel_slice(voxel_grid, axis=1, slice_idx=res // 2)
@@ -428,6 +471,7 @@ def generate_shapes(
                 'shape_id': shape_id,
                 'voxel_grid': voxel_grid,
                 'field_grid': field_grid,
+                'tsdf_grid': tsdf_grid,
                 'n_occupied': n_voxels,
             }
 
@@ -437,6 +481,7 @@ def generate_shapes(
 
             if output_dir:
                 np.save(output_dir / f'shape_{shape_id:04d}_field.npy', field_grid)
+                np.save(output_dir / f'shape_{shape_id:04d}_tsdf.npy', tsdf_grid)
 
             if output_dir and export_mesh:
                 # 优先从连续 SDF 场提取水密表面；若场无有效零交叉则回退到二值体素
@@ -447,11 +492,21 @@ def generate_shapes(
                                          smooth_iters=smooth_iters,
                                          field_smooth_sigma=field_smooth_sigma)
                 else:
-                    print(f'[WARN] 形状 {shape_id} 连续场无有效零交叉，'
-                          f'回退到二值体素网格（field range=[{field_min:.3f}, {field_max:.3f}]）')
-                    mesh = voxel_to_mesh(voxel_grid.astype(np.float32),
-                                         level=0.5,
-                                         smooth_iters=smooth_iters)
+                    tsdf_min = float(tsdf_grid.min())
+                    tsdf_max = float(tsdf_grid.max())
+                    if tsdf_min < field_level < tsdf_max:
+                        print(f'[WARN] 形状 {shape_id} 神经连续场无有效零交叉，'
+                              f'改用体素 TSDF 提面（field range=[{field_min:.3f}, {field_max:.3f}]）')
+                        mesh = field_to_mesh(tsdf_grid, level=field_level,
+                                             smooth_iters=smooth_iters,
+                                             field_smooth_sigma=0.0)
+                    else:
+                        print(f'[WARN] 形状 {shape_id} TSDF 也无有效零交叉，'
+                              f'回退到二值体素网格（field range=[{field_min:.3f}, {field_max:.3f}], '
+                              f'tsdf range=[{tsdf_min:.3f}, {tsdf_max:.3f}]）')
+                        mesh = voxel_to_mesh(voxel_grid.astype(np.float32),
+                                             level=0.5,
+                                             smooth_iters=smooth_iters)
                 if len(mesh.vertices) > 0:
                     mesh.export(str(output_dir / f'shape_{shape_id:04d}.obj'))
                     result['mesh'] = mesh
@@ -504,6 +559,8 @@ def main():
                         help='连续场 Marching Cubes 的 iso 阈值（默认 0.0，对应 SDF 表面）')
     parser.add_argument('--field_smooth_sigma', type=float, default=0.0,
                         help='MC 前对 SDF 场做高斯平滑的 sigma（0=不平滑，建议 0.3~0.8）')
+    parser.add_argument('--tsdf_truncation', type=float, default=4.0,
+                        help='神经连续场无零交叉时，体素 TSDF 的截断距离（体素单位）')
 
     args = parser.parse_args()
 
@@ -554,6 +611,7 @@ def main():
         smooth_iters=args.smooth_iters,
         field_level=args.field_level,
         field_smooth_sigma=args.field_smooth_sigma,
+        tsdf_truncation=args.tsdf_truncation,
         verbose=True,
     )
 

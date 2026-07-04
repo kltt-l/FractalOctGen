@@ -208,11 +208,17 @@ def occupancy_to_sdf(volume: np.ndarray) -> np.ndarray:
     from scipy.ndimage import distance_transform_edt
 
     occ = volume.astype(bool)
-    # dist_in: 到最近内部体素的距离（外部点为正，内部点为 0）
-    # dist_out: 到最近外部体素的距离（内部点为正，外部点为 0）
-    dist_in = distance_transform_edt(occ)
-    dist_out = distance_transform_edt(~occ)
-    sdf = dist_in - dist_out  # 外部为正，内部为负
+    if occ.sum() == 0:
+        return np.ones(occ.shape, dtype=np.float32)
+    if occ.sum() == occ.size:
+        return -np.ones(occ.shape, dtype=np.float32)
+
+    # distance_transform_edt returns the distance to the nearest zero cell.
+    # For occ=True inside: edt(~occ) is distance to the object, positive outside.
+    # For occ=True inside: edt(occ) is distance to empty space, positive inside.
+    dist_to_inside = distance_transform_edt(~occ)
+    dist_to_outside = distance_transform_edt(occ)
+    sdf = dist_to_inside - dist_to_outside
     scale = float(np.max(np.abs(sdf)))
     if scale <= 0:
         scale = 1.0
@@ -291,9 +297,9 @@ def mesh_to_sdf_volume(mesh, resolution: int = 128) -> np.ndarray:
             for i in range(0, len(pts_low), contains_chunk):
                 inside_list.append(mesh.contains(pts_low[i:i + contains_chunk]))
             inside = np.concatenate(inside_list).reshape(low_res, low_res, low_res)
-            dist_in = distance_transform_edt(inside)
-            dist_out = distance_transform_edt(~inside)
-            sdf_low = dist_in - dist_out
+            dist_to_inside = distance_transform_edt(~inside)
+            dist_to_outside = distance_transform_edt(inside)
+            sdf_low = dist_to_inside - dist_to_outside
             if resolution != low_res:
                 sdf = zoom(sdf_low, resolution / low_res, order=1)
             else:

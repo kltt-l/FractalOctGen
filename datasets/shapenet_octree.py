@@ -114,13 +114,15 @@ class ShapeNetOctreeDataset(Dataset):
 
 
 def _pad_stack(tensors: List[torch.Tensor], length: int, is_xyz: bool = False,
-                is_grad: bool = False):
+                is_grad: bool = False, is_field: bool = False):
     """把变长 1D/2D 张量列表 padding 到固定 length 并 stack，同时返回 mask。"""
     B = len(tensors)
     if is_xyz:
         out = torch.zeros(B, length, 3, dtype=torch.float32)
     elif is_grad:
         out = torch.zeros(B, length, 3, dtype=torch.float32)
+    elif is_field:
+        out = torch.zeros(B, length, dtype=torch.float32)
     else:
         out = torch.zeros(B, length, dtype=torch.long)
     mask = torch.zeros(B, length, dtype=torch.bool)
@@ -146,7 +148,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
         max_len = max(b[f'split_{d}'].shape[0] for b in batch)
         max_len = max(max_len, 1)  # 至少 1，避免空张量
         split_pad, mask = _pad_stack([b[f'split_{d}'] for b in batch], max_len)
-        field_pad, _ = _pad_stack([b[f'field_{d}'] for b in batch], max_len)
+        field_pad, _ = _pad_stack([b[f'field_{d}'] for b in batch], max_len, is_field=True)
         grad_pad, _ = _pad_stack([b[f'grad_{d}'] for b in batch], max_len, is_grad=True)
         xyz_pad, _ = _pad_stack([b[f'xyz_{d}'] for b in batch], max_len, is_xyz=True)
         out[f'split_{d}'] = split_pad

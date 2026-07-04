@@ -106,11 +106,20 @@ print('  [OK] 采样生成正确')
 
 # ── 9. 体素转网格 ──────────────────────────────────────────────────────────────
 print('\n[9] 测试体素转网格...')
-from generate import sample_to_voxel_grid, voxel_to_mesh, sample_to_field_grid, field_to_mesh
+from generate import sample_to_voxel_grid, voxel_to_mesh, sample_to_field_grid, field_to_mesh, voxel_to_tsdf_grid
 voxel = sample_to_voxel_grid(so['split'][fd][0], so['xyz'][fd][0], finest_depth=fd)
 print(f'  体素网格形状 {voxel.shape}，占据 {int(voxel.sum())}')
 field = sample_to_field_grid(so['field'][fd][0], so['xyz'][fd][0], finest_depth=fd)
 print(f'  连续场网格形状 {field.shape}，范围 [{field.min():.3f}, {field.max():.3f}]')
+probe_field = sample_to_field_grid(
+    torch.tensor([-0.02, 0.25]),
+    torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),
+    finest_depth=1,
+)
+assert abs(float(probe_field[0, 0, 0]) + 0.02) < 1e-6
+assert abs(float(probe_field[1, 1, 1]) - 0.25) < 1e-6
+tsdf = voxel_to_tsdf_grid(voxel)
+print(f'  TSDF 网格范围 [{tsdf.min():.3f}, {tsdf.max():.3f}]')
 mesh_voxel = voxel_to_mesh(voxel.astype(float))
 print(f'  二值体素网格顶点 {len(mesh_voxel.vertices)}，三角面 {len(mesh_voxel.faces)}')
 if field.min() < 0.0 < field.max():
