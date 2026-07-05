@@ -55,12 +55,17 @@ DEFAULT_CONFIG = {
     'occ_attn_heads': 8,      # 须整除 occ_hidden_dim（512/8=64）
     'occ_attn_layers': 3,
     # 细层辅助监督：用同父节点的软概率平滑二值目标，缓解薄壳/空洞
-    'aux_soft_weight': 0.20,
+    # Split-only fine-tune override (2026-07-04):
+    # Focus on occupancy/split BCE first; restore these three weights after
+    # d4-d6 structure becomes stable.
+    # Original values: aux_soft_weight=0.20, field_loss_weight=0.50,
+    # grad_loss_weight=0.30.
+    'aux_soft_weight': 0.05,
     'aux_soft_blend': 0.35,
     'aux_soft_start_depth': 4,
-    'field_loss_weight': 0.50,
+    'field_loss_weight': 0.0,
     'field_loss_start_depth': 4,
-    'grad_loss_weight': 0.30,
+    'grad_loss_weight': 0.0,
     'grad_loss_start_depth': 6,
 }
 
@@ -344,6 +349,145 @@ class FractalOctGen(nn.Module):
                     parent_split=cur_split, parent_xyz=cur_xyz, parent_cond=cur_cond,
                     parent_depth=cur_depth, occ_module=self.occ_modules[j],
                     temperature=temperature_l2, device=device)
+                cur_depth = d
+                out_split[d].append(cur_split)
+                out_field[d].append(cur_field)
+                out_xyz[d].append(cur_xyz)
+
+        return {
+            'split': out_split,
+            'field': out_field,
+            'xyz': out_xyz,
+            'depths': self.all_depths,
+            'finest_depth': self.occ_depths[-1] if self.occ_depths else self.ar_depths[-1],
+        }
+
+    @torch.no_grad()
+    def sample_with_prefix(
+        self,
+        prefix: Dict[str, torch.Tensor],
+        prefix_depth: int = 3,
+        batch_size: int = 1,
+        class_id: int = 0,
+        temperature_l0: float = 1.0,
+        temperature_l1: float = 1.0,
+        temperature_l2: float = 0.0,
+        device: torch.device = None,
+        **kwargs,
+    ) -> Dict[str, object]:
+        """用真实粗层八叉树作为 prefix，然后从下一层继续采样。
+
+        prefix 至少需要包含 split_d/xyz_d；当 prefix_depth >= 3 时还需要
+        parent_idx_d。关键点是 prefix 层仍通过 teacher forcing 跑一遍模型，
+        得到后续层需要的 cond_full，而不是只把 split/xyz 复制进输出。
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        if prefix_depth not in self.all_depths:
+            raise ValueError(f'prefix_depth={prefix_depth} 不在预测层 {self.all_depths} 中')
+
+        B = batch_size
+        class_ids = torch.full((B,), class_id, dtype=torch.long, device=device)
+        class_cond = self.class_emb(class_ids).unsqueeze(1)
+
+        def take(key: str, dtype=None) -> torch.Tensor:
+            if key not in prefix:
+                raise KeyError(f'prefix 缺少 {key}')
+            x = prefix[key].to(device)
+            if dtype is not None:
+                x = x.to(dtype=dtype)
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
+            elif x.dim() == 2 and key.startswith('xyz_'):
+                x = x.unsqueeze(0)
+            if x.shape[0] == 1 and B > 1:
+                x = x.expand(B, *x.shape[1:]).contiguous()
+            if x.shape[0] != B:
+                raise ValueError(f'{key} batch={x.shape[0]} 与 batch_size={B} 不一致')
+            return x
+
+        prefix_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        prev_cond_full: Optional[torch.Tensor] = None
+
+        # Prefix 中的 AR 层：用 teacher forcing 计算 cond。
+        for i, d in enumerate(self.ar_depths):
+            if d > prefix_depth:
+                break
+            split_d = take(f'split_{d}', torch.long)
+            xyz_d = take(f'xyz_{d}', torch.float32)
+            field_key = f'field_{d}'
+            field_d = take(field_key, torch.float32) if field_key in prefix else split_d.float()
+            mask_d = torch.ones(split_d.shape, dtype=torch.bool, device=device)
+
+            if i == 0:
+                parent_cond = class_cond
+            else:
+                parent_idx_d = take(f'parent_idx_{d}', torch.long)
+                parent_cond = _gather_parent_cond(prev_cond_full, parent_idx_d, mask_d)
+
+            cond_full, _, _, _ = self.ar_modules[i](
+                split_labels=split_d,
+                xyz=xyz_d,
+                parent_cond=parent_cond,
+                padding_mask=mask_d,
+            )
+            prefix_cache[d] = (split_d, field_d, xyz_d, cond_full)
+            prev_cond_full = cond_full
+
+        # 可选支持固定到 d4/d5：OCC prefix 同样前向一次得到 cond。
+        for j, d in enumerate(self.occ_depths):
+            if d > prefix_depth:
+                break
+            split_d = take(f'split_{d}', torch.long)
+            xyz_d = take(f'xyz_{d}', torch.float32)
+            field_key = f'field_{d}'
+            field_d = take(field_key, torch.float32) if field_key in prefix else split_d.float()
+            mask_d = torch.ones(split_d.shape, dtype=torch.bool, device=device)
+            parent_idx_d = take(f'parent_idx_{d}', torch.long)
+            parent_cond = _gather_parent_cond(prev_cond_full, parent_idx_d, mask_d)
+
+            _, _, _, cond_full = self.occ_modules[j](
+                xyz=xyz_d, parent_cond=parent_cond, mask=mask_d)
+            prefix_cache[d] = (split_d, field_d, xyz_d, cond_full)
+            prev_cond_full = cond_full
+
+        if prefix_depth not in prefix_cache:
+            raise ValueError(f'无法从 prefix 计算到 depth {prefix_depth}')
+
+        out_split = {d: [] for d in self.all_depths}
+        out_field = {d: [] for d in self.all_depths}
+        out_xyz = {d: [] for d in self.all_depths}
+
+        ar_module_by_depth = {d: self.ar_modules[i] for i, d in enumerate(self.ar_depths)}
+        occ_module_by_depth = {d: self.occ_modules[i] for i, d in enumerate(self.occ_depths)}
+
+        for b in range(B):
+            for d in self.all_depths:
+                if d > prefix_depth:
+                    break
+                split_d, field_d, xyz_d, _ = prefix_cache[d]
+                out_split[d].append(split_d[b])
+                out_field[d].append(field_d[b])
+                out_xyz[d].append(xyz_d[b])
+
+            cur_split, cur_field, cur_xyz, cur_cond = (
+                item[b] for item in prefix_cache[prefix_depth]
+            )
+            cur_depth = prefix_depth
+
+            for d in self.all_depths:
+                if d <= prefix_depth:
+                    continue
+                if d in ar_module_by_depth:
+                    cur_split, cur_field, cur_xyz, cur_cond = self._sample_ar_level(
+                        parent_split=cur_split, parent_xyz=cur_xyz, parent_cond=cur_cond,
+                        parent_depth=cur_depth, ar_module=ar_module_by_depth[d],
+                        temperature=temperature_l1, device=device)
+                else:
+                    cur_split, cur_field, cur_xyz, cur_cond = self._sample_occ_level(
+                        parent_split=cur_split, parent_xyz=cur_xyz, parent_cond=cur_cond,
+                        parent_depth=cur_depth, occ_module=occ_module_by_depth[d],
+                        temperature=temperature_l2, device=device)
                 cur_depth = d
                 out_split[d].append(cur_split)
                 out_field[d].append(cur_field)

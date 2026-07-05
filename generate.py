@@ -28,6 +28,28 @@ from models.fractal_oct_gen import (
 from utils.octree_utils import OCTREE_DEPTH, FULL_DEPTH
 
 
+def load_prefix_npz(npz_path: str, prefix_depth: int) -> dict:
+    """Load coarse octree tensors used by model.sample_with_prefix()."""
+    data = np.load(npz_path, allow_pickle=False)
+    prefix = {}
+    for d in range(FULL_DEPTH, prefix_depth + 1):
+        for name in ('split', 'xyz', 'field', 'parent_idx'):
+            key = f'{name}_{d}'
+            if key in data.files:
+                arr = data[key]
+                if name in ('split', 'parent_idx'):
+                    prefix[key] = torch.from_numpy(np.ascontiguousarray(arr)).long()
+                else:
+                    prefix[key] = torch.from_numpy(np.ascontiguousarray(arr)).float()
+
+        if f'split_{d}' not in prefix or f'xyz_{d}' not in prefix:
+            raise KeyError(f'{npz_path} 缺少 split_{d} 或 xyz_{d}')
+        if d > FULL_DEPTH and f'parent_idx_{d}' not in prefix:
+            raise KeyError(f'{npz_path} 缺少 parent_idx_{d}')
+
+    return prefix
+
+
 # ─── 体素后处理：薄壳 → 实体（封孔 + 填充 + 去碎块）────────────────────────────
 
 def postprocess_voxel_grid(
@@ -367,6 +389,9 @@ def generate_shapes(
     field_level: float = 0.0,
     field_smooth_sigma: float = 0.0,
     tsdf_truncation: float = 4.0,
+    mesh_source: str = 'field',
+    prefix: dict = None,
+    prefix_depth: int = 3,
     verbose: bool = True,
 ) -> list:
     """
@@ -390,6 +415,9 @@ def generate_shapes(
         field_level: 连续场 Marching Cubes 的 iso 阈值
         field_smooth_sigma: MC 前对 SDF 做高斯平滑的 sigma（0=不平滑）
         tsdf_truncation: 神经场无零交叉时，从实体体素生成 TSDF 的截断距离（体素单位）
+        mesh_source: 网格来源，field=优先神经场，tsdf=体素 TSDF，voxel=二值体素。
+        prefix: 粗层八叉树提示；不为 None 时固定 d2..prefix_depth 后继续生成。
+        prefix_depth: prefix 固定到的最深层，推荐 3。
 
     Returns:
         list of dict（每个形状的结果）
@@ -407,14 +435,26 @@ def generate_shapes(
         t0 = time.time()
 
         with torch.no_grad():
-            out = model.sample(
-                batch_size=cur_batch,
-                class_id=0,
-                temperature_l0=temperature_l0,
-                temperature_l1=temperature_l1,
-                temperature_l2=temperature_l2,
-                device=device,
-            )
+            if prefix is None:
+                out = model.sample(
+                    batch_size=cur_batch,
+                    class_id=0,
+                    temperature_l0=temperature_l0,
+                    temperature_l1=temperature_l1,
+                    temperature_l2=temperature_l2,
+                    device=device,
+                )
+            else:
+                out = model.sample_with_prefix(
+                    prefix=prefix,
+                    prefix_depth=prefix_depth,
+                    batch_size=cur_batch,
+                    class_id=0,
+                    temperature_l0=temperature_l0,
+                    temperature_l1=temperature_l1,
+                    temperature_l2=temperature_l2,
+                    device=device,
+                )
 
         gen_time = time.time() - t0
         if verbose:
@@ -484,16 +524,36 @@ def generate_shapes(
                 np.save(output_dir / f'shape_{shape_id:04d}_tsdf.npy', tsdf_grid)
 
             if output_dir and export_mesh:
-                # 优先从连续 SDF 场提取水密表面；若场无有效零交叉则回退到二值体素
                 field_min = float(field_grid.min())
                 field_max = float(field_grid.max())
-                if field_min < field_level < field_max:
-                    mesh = field_to_mesh(field_grid, level=field_level,
-                                         smooth_iters=smooth_iters,
-                                         field_smooth_sigma=field_smooth_sigma)
+                tsdf_min = float(tsdf_grid.min())
+                tsdf_max = float(tsdf_grid.max())
+
+                if mesh_source == 'tsdf':
+                    if tsdf_min < 0.0 < tsdf_max:
+                        mesh = field_to_mesh(tsdf_grid, level=0.0,
+                                             smooth_iters=smooth_iters,
+                                             field_smooth_sigma=0.0)
+                    else:
+                        print(f'[WARN] 形状 {shape_id} TSDF 无有效零交叉，'
+                              f'回退到二值体素网格（tsdf range=[{tsdf_min:.3f}, {tsdf_max:.3f}]）')
+                        mesh = voxel_to_mesh(voxel_grid.astype(np.float32),
+                                             level=0.5,
+                                             smooth_iters=smooth_iters)
+                elif mesh_source == 'voxel':
+                    mesh = voxel_to_mesh(voxel_grid.astype(np.float32),
+                                         level=0.5,
+                                         smooth_iters=smooth_iters)
                 else:
-                    tsdf_min = float(tsdf_grid.min())
-                    tsdf_max = float(tsdf_grid.max())
+                    # 优先从连续 SDF 场提取水密表面；若场无有效零交叉则回退到体素 TSDF/二值体素。
+                    if field_min < field_level < field_max:
+                        mesh = field_to_mesh(field_grid, level=field_level,
+                                             smooth_iters=smooth_iters,
+                                             field_smooth_sigma=field_smooth_sigma)
+                    else:
+                        mesh = None
+
+                if mesh_source == 'field' and not (field_min < field_level < field_max):
                     if tsdf_min < field_level < tsdf_max:
                         print(f'[WARN] 形状 {shape_id} 神经连续场无有效零交叉，'
                               f'改用体素 TSDF 提面（field range=[{field_min:.3f}, {field_max:.3f}]）')
@@ -541,6 +601,10 @@ def main():
     parser.add_argument('--temperature_l0', type=float, default=0.9)
     parser.add_argument('--temperature_l1', type=float, default=0.9)
     parser.add_argument('--temperature_l2', type=float, default=0.0)
+    parser.add_argument('--prefix_npz', type=str, default='',
+                        help='用一个预处理 .npz 的 d2/d3 粗结构作为生成提示')
+    parser.add_argument('--prefix_depth', type=int, default=3,
+                        help='固定 prefix 到哪一层；推荐 3，表示固定 d2+d3，生成 d4-d6')
 
     parser.add_argument('--no_mesh', action='store_true', help='不导出网格文件')
     parser.add_argument('--no_voxel', action='store_true', help='不导出体素文件')
@@ -561,6 +625,9 @@ def main():
                         help='MC 前对 SDF 场做高斯平滑的 sigma（0=不平滑，建议 0.3~0.8）')
     parser.add_argument('--tsdf_truncation', type=float, default=4.0,
                         help='神经连续场无零交叉时，体素 TSDF 的截断距离（体素单位）')
+    parser.add_argument('--mesh_source', type=str, default='field',
+                        choices=['field', 'tsdf', 'voxel'],
+                        help='网格来源：field=优先神经连续场，tsdf=强制体素 TSDF，voxel=强制二值体素')
 
     args = parser.parse_args()
 
@@ -590,6 +657,14 @@ def main():
     model = model.to(device)
     model.eval()
 
+    prefix = None
+    if args.prefix_npz:
+        if not os.path.exists(args.prefix_npz):
+            print(f'[错误] Prefix .npz 不存在: {args.prefix_npz}')
+            return
+        prefix = load_prefix_npz(args.prefix_npz, args.prefix_depth)
+        print(f'已加载 prefix: {args.prefix_npz} (depth <= {args.prefix_depth})')
+
     # ── 生成 ──────────────────────────────────────────────────────────────────
     print(f'\n开始生成 {args.num_samples} 个形状...\n')
 
@@ -612,6 +687,9 @@ def main():
         field_level=args.field_level,
         field_smooth_sigma=args.field_smooth_sigma,
         tsdf_truncation=args.tsdf_truncation,
+        mesh_source=args.mesh_source,
+        prefix=prefix,
+        prefix_depth=args.prefix_depth,
         verbose=True,
     )
 

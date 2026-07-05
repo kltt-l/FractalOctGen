@@ -366,7 +366,7 @@ def compute_sdf_gradient_volume(sdf_volume: np.ndarray) -> np.ndarray:
 
     # 轻微高斯平滑后再求导，抑制数值噪声
     smooth = gaussian_filter(sdf_volume, sigma=0.5)
-    gz, gy, gx = np.gradient(smooth)
+    gx, gy, gz = np.gradient(smooth)
     return np.stack([gx, gy, gz], axis=-1).astype(np.float32)
 
 
